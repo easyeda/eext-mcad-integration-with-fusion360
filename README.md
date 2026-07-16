@@ -57,6 +57,7 @@
 [EasyEDA] Add-in 启动完成 ✅
 [EasyEDA] Starting WebSocket server on ws://0.0.0.0:8767
 ```
+（文本命令窗口默认不显示，可以在“文件->视图->显示文本命令”中打开）
 
 ## 使用教程
 
