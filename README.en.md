@@ -2,6 +2,16 @@
 
 # Fusion360 MCAD Integration — EasyEDA Pro Extension
 
+> ## What's fixed in 1.1.3
+> - **STEP import no longer times out ([#2](https://github.com/easyeda/eext-mcad-integration-with-fusion360/issues/2))**: the add-in uses Fusion's documented `importManager` API instead of the `Translator.Import` text command
+> - **Logging is thread-safe** and also written to `~/easyeda_fusion.log`
+> - **Stop/Run works**: stopping the add-in shuts down the WebSocket server and frees port 8767
+> - **Localhost only**: the server listens on `127.0.0.1` instead of `0.0.0.0`
+> - **Faster uploads** for large boards, and no duplicate imports
+> - **Bottom-side parts stay flipped** when moved
+>
+> Only the Fusion add-in changed: replace the Fusion script with `script/Interactive-with-fusion.py`.
+
 Real-time collaboration between EasyEDA Pro and Fusion360 via WebSocket + HTTP. Supports model export, bidirectional position sync, cross-probe, and deletion sync.
 
 ## Features

@@ -2,6 +2,16 @@
 
 # Fusion360 机电协同 —— 嘉立创 EDA 专业版扩展
 
+> ## 1.1.3 修复内容
+> - **STEP 导入不再超时（[#2](https://github.com/easyeda/eext-mcad-integration-with-fusion360/issues/2)）**：附加模块改用 Fusion 官方 `importManager` API，替代 `Translator.Import` 文本命令
+> - **日志线程安全**，并同时写入 `~/easyeda_fusion.log`
+> - **停止/运行可用**：停止附加模块时关闭 WebSocket 服务器并释放端口 8767
+> - **仅监听本机**：服务器绑定 `127.0.0.1` 而不是 `0.0.0.0`
+> - **大板子上传更快**，且不会重复导入
+> - **移动元件时底层元件保持翻转**
+>
+> 只修改了 Fusion 附加模块：用 `script/Interactive-with-fusion.py` 替换 Fusion 中的脚本即可。
+
 通过 WebSocket + HTTP 实现 PCB 3D 模型在嘉立创 EDA 与 Fusion360 之间的实时协同。支持模型导出、双向位置同步、交叉定位、删除同步。
 
 ## 功能特性

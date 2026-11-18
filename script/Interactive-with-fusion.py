@@ -21,18 +21,37 @@ try:
 except ImportError:
     FUSION_AVAILABLE = False
 
+_LOG_FILE = os.path.join(os.path.expanduser("~"), "easyeda_fusion.log")
+
 def _log(msg):
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-    log_msg = f"[{timestamp}] [EasyEDA] {msg}"
+    tname = "main" if threading.current_thread() is threading.main_thread() else "ws"
+    log_msg = f"[{timestamp}] [EasyEDA:{tname}] {msg}"
+    try:
+        with open(_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(log_msg + "\n")
+    except Exception:
+        pass
     if FUSION_AVAILABLE:
-        try:
-            app = adsk.core.Application.get()
-            if app:
-                app.log(log_msg)
-                return
-        except Exception:
-            pass
+        if tname == "main":
+            try:
+                adsk.core.Application.get().log(log_msg)
+            except Exception:
+                pass
+        else:
+            # Fusion API is not thread-safe: hand the log line to the main thread
+            try:
+                _call_main_fire(_main_log, log_msg)
+            except Exception:
+                pass
+        return
     print(log_msg)
+
+def _main_log(line):
+    try:
+        adsk.core.Application.get().log(line)
+    except Exception:
+        pass
 
 # ==================== WebSocket ====================
 _WS_OP_TEXT = 0x1
@@ -148,10 +167,12 @@ class _WebSocketConnection:
         try:
             if masked:
                 mask_key = await self._reader.readexactly(4)
-                payload = bytearray(await self._reader.readexactly(length))
-                for i in range(len(payload)):
-                    payload[i] ^= mask_key[i % 4]
-                payload = bytes(payload)
+                raw = await self._reader.readexactly(length)
+                if length:
+                    m = (mask_key * (length // 4 + 1))[:length]
+                    payload = (int.from_bytes(raw, 'big') ^ int.from_bytes(m, 'big')).to_bytes(length, 'big')
+                else:
+                    payload = b''
             else:
                 payload = await self._reader.readexactly(length)
         except (asyncio.IncompleteReadError, ConnectionError, OSError):
@@ -242,12 +263,17 @@ async def _ws_serve(handler, host, port):
                     writer.close()
             except Exception:
                 pass
+    global _ws_server
     server = await asyncio.start_server(on_connect, host, port)
+    _ws_server = server
+    _log("WebSocket server listening on {}:{}".format(host, port))
     async with server:
         await server.serve_forever()
 
 # ==================== config ====================
-HOST = "0.0.0.0"
+ADDIN_VERSION = "1.1.3"
+# localhost only: the server accepts file uploads and design commands
+HOST = "127.0.0.1"
 PORT = 8767
 TEMP_DIR = tempfile.gettempdir()
 
@@ -259,6 +285,9 @@ upload_sessions: Dict[str, dict] = {}
 monitor_enabled = False
 _active_client = None
 _ws_loop = None
+_ws_server = None
+_importing = False
+_ws_thread = None
 _last_positions: Dict[str, Tuple[float, float, float]] = {}
 _last_selected: set = set()
 _imported_design = None
@@ -276,6 +305,11 @@ class _TaskEventHandler(adsk.core.CustomEventHandler):
                 task = _task_queue.get_nowait()
             except queue.Empty:
                 break
+            fname = getattr(task['func'], '__name__', '?')
+            verbose = fname not in ('_main_log', '_do_poll_and_push')
+            t0 = time.time()
+            if verbose:
+                _log("[TM] main thread start: {}".format(fname))
             try:
                 result = task['func'](*task.get('args', ()), **task.get('kwargs', {}))
                 task['result'] = result
@@ -284,6 +318,9 @@ class _TaskEventHandler(adsk.core.CustomEventHandler):
                 task['error'] = traceback.format_exc()
             finally:
                 task['done'].set()
+                if verbose:
+                    _log("[TM] main thread done: {} ({:.1f}s){}".format(
+                        fname, time.time() - t0, " ERROR" if task.get('error') else ""))
             count += 1
 
 def _call_main(func, *args, timeout=5.0):
@@ -384,19 +421,19 @@ def _get_occ_transform(occ) -> Tuple[float, float, float, float]:
     return x, y, z, rot_z
 
 def _set_occ_transform(occ, x_cm, y_cm, z_cm, rotation_deg) -> None:
-    transform = occ.transform2
-    transform.setToIdentity()
-    rad = math.radians(rotation_deg)
-    cos_r = math.cos(rad)
-    sin_r = math.sin(rad)
-    transform.setCell(0, 0, cos_r)
-    transform.setCell(0, 1, -sin_r)
-    transform.setCell(1, 0, sin_r)
-    transform.setCell(1, 1, cos_r)
-    transform.setCell(2, 2, 1.0)
-    transform.setCell(3, 3, 1.0)
-    transform.translation = adsk.core.Vector3D.create(x_cm, y_cm, z_cm)
-    occ.transform2 = transform
+    """Rotate about Z by the change in angle and set the translation.
+    Keeps the part's existing orientation (bottom-side parts stay flipped)."""
+    m = occ.transform2
+    cur_rot = math.degrees(math.atan2(m.getCell(1, 0), m.getCell(0, 0)))
+    d = math.radians(rotation_deg - cur_rot)
+    c, s = math.cos(d), math.sin(d)
+    r = [[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]]
+    old = [[m.getCell(i, j) for j in range(3)] for i in range(3)]
+    for i in range(3):
+        for j in range(3):
+            m.setCell(i, j, sum(r[i][k] * old[k][j] for k in range(3)))
+    m.translation = adsk.core.Vector3D.create(x_cm, y_cm, z_cm)
+    occ.transform2 = m
 
 def _import_step(filepath: str) -> bool:
     global _imported_design
@@ -404,38 +441,35 @@ def _import_step(filepath: str) -> bool:
     if not app:
         _log("No app")
         return False
-    # 新建一个 Fusion 设计文档
+    _log("Import: file {} ({:.1f} MB)".format(filepath, os.path.getsize(filepath) / 1e6))
     try:
-        doc = app.documents.add(adsk.core.DocumentTypes.FusionDesignDocumentType)
-        if doc:
-            doc.activate()
-            _log("Created new design document")
-    except Exception:
-        _log("Create document failed, using current: " + traceback.format_exc()[:200])
-    # 导入 STEP
-    try:
-        result = app.executeTextCommand('Translator.Import {}'.format(filepath))
-        _log("Import result: {}".format((result or '')[:200]))
+        im = app.importManager
+        opts = im.createSTEPImportOptions(filepath)
+        _log("Import: importToNewDocument...")
+        doc = im.importToNewDocument(opts)
+        _log("Import: importToNewDocument returned {}".format(bool(doc)))
     except Exception:
         _log("Import failed: " + traceback.format_exc())
         return False
-    time.sleep(3)
     try:
-        design = app.activeProduct
-        if design and isinstance(design, adsk.fusion.Design):
+        design = None
+        if doc:
+            design = adsk.fusion.Design.cast(doc.products.itemByProductType('DesignProductType'))
+        if not design:
+            design = adsk.fusion.Design.cast(app.activeProduct)
+        if design:
             _imported_design = design
-            # 切换到直接设计模式
             try:
                 if design.designType != adsk.fusion.DesignTypes.DirectDesignType:
                     design.designType = adsk.fusion.DesignTypes.DirectDesignType
                     _log("Switched to Direct Design mode")
             except Exception:
-                pass
+                _log("Direct mode switch failed: " + traceback.format_exc()[:200])
             occs = design.rootComponent.allOccurrences.count
             _log("Design OK: {} occs".format(occs))
             return occs > 0
     except Exception:
-        pass
+        _log("Post-import failed: " + traceback.format_exc())
     _log("No design after import")
     return False
 
@@ -763,6 +797,13 @@ async def _handle_message(raw_message):
             await _send_to_client({"type": "pong"})
         elif msg_type == "file_upload_start":
             session_id = message["sessionId"]
+            if _importing:
+                _log("Upload rejected: an import is already running")
+                await _send_to_client({"type": "error", "message": "Import already running in Fusion, ignored duplicate export"})
+                return
+            if upload_sessions:
+                _log("New upload supersedes {} unfinished upload(s)".format(len(upload_sessions)))
+                upload_sessions.clear()
             upload_sessions[session_id] = {
                 "filename": message["filename"],
                 "totalSize": message["totalSize"],
@@ -831,17 +872,26 @@ async def handle_client(websocket):
         _log("Client disconnected")
 
 async def _process_upload(session_id: str) -> None:
+    global _importing
+    _importing = True
+    try:
+        await _process_upload_inner(session_id)
+    finally:
+        _importing = False
+
+async def _process_upload_inner(session_id: str) -> None:
     _log(f"=== 文件上传处理开始 ===")
     session = upload_sessions.pop(session_id, None)
     if not session:
         _log("错误: 上传会话不存在")
         return
     await _send_to_client({"type": "upload_complete", "sessionId": session_id})
-    all_data = b""
-    for i in range(session["totalChunks"]):
-        chunk_b64 = session["chunks"].get(i)
-        if chunk_b64:
-            all_data += base64.b64decode(chunk_b64)
+    missing = [i for i in range(session["totalChunks"]) if i not in session["chunks"]]
+    if missing:
+        _log("WARNING: missing chunks: {}".format(missing[:20]))
+    all_data = b"".join(base64.b64decode(session["chunks"][i])
+                        for i in range(session["totalChunks"]) if i in session["chunks"])
+    _log("Upload assembled: {:.1f} MB, firing import".format(len(all_data) / 1e6))
     filename = session["filename"]
     filepath = os.path.join(TEMP_DIR, "easyeda_{}".format(filename))
     try:
@@ -851,7 +901,7 @@ async def _process_upload(session_id: str) -> None:
         _log(f"文件保存失败: {e}")
         return
     await _send_to_client({"type": "import_started", "sessionId": session_id})
-    success = await _call_main_await(_import_step, filepath, timeout=60.0)
+    success = await _call_main_await(_import_step, filepath, timeout=600.0)
     if success:
         await _send_to_client({
             "type": "import_complete",
@@ -859,9 +909,10 @@ async def _process_upload(session_id: str) -> None:
             "details": "success {}".format(filename),
         })
     else:
-        await _send_to_client({"type": "error", "message": "fail"})
+        await _send_to_client({"type": "error", "message": "fail - see ~/easyeda_fusion.log"})
     try:
-        os.remove(filepath)
+        if success:
+            os.remove(filepath)
     except Exception:
         pass
 
@@ -875,10 +926,15 @@ def _start_ws_thread():
     asyncio.set_event_loop(_ws_loop)
     try:
         _ws_loop.run_until_complete(_run_server())
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, asyncio.CancelledError):
         _log("Server stopped")
+    except BaseException:
+        _log("Server error: " + traceback.format_exc())
     finally:
-        _ws_loop.close()
+        try:
+            _ws_loop.close()
+        except Exception:
+            pass
 
 # ==================== 主线程定时推送（替代 HTTP 轮询）====================
 
@@ -931,9 +987,10 @@ def run(context):
         _log("CustomEvent registered: {}".format(_custom_event_id))
     else:
         _log("WARNING: app not available")
-    ws_thread = threading.Thread(target=_start_ws_thread, daemon=True)
-    ws_thread.start()
-    _log("Add-in started")
+    global _ws_thread
+    _ws_thread = threading.Thread(target=_start_ws_thread, daemon=True, name="easyeda-ws")
+    _ws_thread.start()
+    _log("Add-in started, version {}".format(ADDIN_VERSION))
 
 def stop(context):
     global monitor_enabled, _active_client, _imported_design
@@ -950,6 +1007,28 @@ def stop(context):
     except Exception:
         pass
     monitor_enabled = False
+    # shut down the WebSocket server and client so the port is released
+    try:
+        loop = _ws_loop
+        if loop is not None and loop.is_running():
+            def _shutdown():
+                try:
+                    if _active_client is not None:
+                        _active_client._closed = True
+                        _active_client._writer.close()
+                except Exception:
+                    pass
+                try:
+                    if _ws_server is not None:
+                        _ws_server.close()
+                except Exception:
+                    pass
+            loop.call_soon_threadsafe(_shutdown)
+        if _ws_thread is not None:
+            _ws_thread.join(timeout=3.0)
+            _log("WebSocket thread alive after stop: {}".format(_ws_thread.is_alive()))
+    except Exception:
+        _log("WS shutdown error: " + traceback.format_exc()[:200])
     _imported_design = None
     _active_client = None
     designator_map.clear()
