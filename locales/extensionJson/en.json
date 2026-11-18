@@ -6,5 +6,6 @@
 	"启用双向交互": "Enable Bidirectional",
 	"停止双向交互": "Disable Bidirectional",
 	"断开Fusion360": "Disconnect Fusion360",
-	"下载脚本文件": "Download Script"
+	"下载脚本文件": "Download Script",
+	"导出设置": "Fusion 360 export settings"
 }

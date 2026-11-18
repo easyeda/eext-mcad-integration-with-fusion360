@@ -21,18 +21,37 @@ try:
 except ImportError:
     FUSION_AVAILABLE = False
 
+_LOG_FILE = os.path.join(os.path.expanduser("~"), "easyeda_fusion.log")
+
 def _log(msg):
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-    log_msg = f"[{timestamp}] [EasyEDA] {msg}"
+    tname = "main" if threading.current_thread() is threading.main_thread() else "ws"
+    log_msg = f"[{timestamp}] [EasyEDA:{tname}] {msg}"
+    try:
+        with open(_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(log_msg + "\n")
+    except Exception:
+        pass
     if FUSION_AVAILABLE:
-        try:
-            app = adsk.core.Application.get()
-            if app:
-                app.log(log_msg)
-                return
-        except Exception:
-            pass
+        if tname == "main":
+            try:
+                adsk.core.Application.get().log(log_msg)
+            except Exception:
+                pass
+        else:
+            # Fusion API is not thread-safe: hand the log line to the main thread
+            try:
+                _call_main_fire(_main_log, log_msg)
+            except Exception:
+                pass
+        return
     print(log_msg)
+
+def _main_log(line):
+    try:
+        adsk.core.Application.get().log(line)
+    except Exception:
+        pass
 
 # ==================== WebSocket ====================
 _WS_OP_TEXT = 0x1
@@ -148,10 +167,12 @@ class _WebSocketConnection:
         try:
             if masked:
                 mask_key = await self._reader.readexactly(4)
-                payload = bytearray(await self._reader.readexactly(length))
-                for i in range(len(payload)):
-                    payload[i] ^= mask_key[i % 4]
-                payload = bytes(payload)
+                raw = await self._reader.readexactly(length)
+                if length:
+                    m = (mask_key * (length // 4 + 1))[:length]
+                    payload = (int.from_bytes(raw, 'big') ^ int.from_bytes(m, 'big')).to_bytes(length, 'big')
+                else:
+                    payload = b''
             else:
                 payload = await self._reader.readexactly(length)
         except (asyncio.IncompleteReadError, ConnectionError, OSError):
@@ -242,13 +263,56 @@ async def _ws_serve(handler, host, port):
                     writer.close()
             except Exception:
                 pass
+    global _ws_server
     server = await asyncio.start_server(on_connect, host, port)
+    _ws_server = server
+    _log("WebSocket server listening on {}:{}".format(host, port))
     async with server:
         await server.serve_forever()
 
 # ==================== config ====================
-HOST = "0.0.0.0"
+ADDIN_VERSION = "1.2.6"   # keep in sync with the .manifest "version"
+HOST = "127.0.0.1"
 PORT = 8767
+# True: import the PCB as a component into the active design (keeps its timeline,
+#       no Direct-mode switch). False: original behaviour, new document in Direct mode.
+IMPORT_INTO_ACTIVE = True
+# Parametric designs only: seconds of no EasyEDA moves before positions are captured
+# (Capture Position snapshot). 0 = never auto-capture.
+AUTO_CAPTURE_DELAY_S = 0
+# Keep only one add-in capture in the timeline: each new capture replaces the previous one
+# (identified by CAPTURE_NAME). Captures you make yourself are never touched.
+SINGLE_CAPTURE = True
+# Which axis is "up" in the Fusion design. EasyEDA's STEP is Z-up (board in the XY plane).
+# "auto": follow Fusion's Preferences > General > Default modeling orientation.
+# "y": rotate the imported board so its top faces +Y.  "z": leave as imported.
+BOARD_UP_AXIS = "auto"
+# The constants above are defaults. The EasyEDA extension can override them per export
+# via an "options" object (importMode, upAxis, captureMode, captureDelay, singleCapture).
+_OPTS: Dict[str, Any] = {}
+
+def _import_active() -> bool:
+    return _OPTS.get("importMode", "active" if IMPORT_INTO_ACTIVE else "new") == "active"
+
+def _up_axis() -> str:
+    return _OPTS.get("upAxis", BOARD_UP_AXIS)
+
+def _capture_mode() -> str:
+    # "auto": after captureDelay s without moves; "end": when sync stops; "off": never
+    return _OPTS.get("captureMode", "auto" if AUTO_CAPTURE_DELAY_S > 0 else "end")
+
+def _capture_delay() -> float:
+    if _capture_mode() != "auto":
+        return 0.0
+    try:
+        return max(0.5, float(_OPTS.get("captureDelay", AUTO_CAPTURE_DELAY_S or 3.0)))
+    except Exception:
+        return 3.0
+
+def _single_capture() -> bool:
+    return bool(_OPTS.get("singleCapture", SINGLE_CAPTURE))
+CAPTURE_NAME = "EasyEDA PCB"
+PLACEMENT_CAPTURE_NAME = "EasyEDA placement"   # board position, kept separate from part moves
 TEMP_DIR = tempfile.gettempdir()
 
 # ==================== state ====================
@@ -259,9 +323,15 @@ upload_sessions: Dict[str, dict] = {}
 monitor_enabled = False
 _active_client = None
 _ws_loop = None
+_ws_server = None
+_ws_thread = None
 _last_positions: Dict[str, Tuple[float, float, float]] = {}
 _last_selected: set = set()
 _imported_design = None
+_board_occs: List[Any] = []          # top-level occurrence(s) created by the PCB import
+_occ_objs: Dict[str, Any] = {}       # designator -> occurrence (proxy) object
+_last_move_time = 0.0
+_importing = False
 
 # ==================== TaskManager (CustomEvent + Queue) ====================
 _task_queue = queue.Queue()
@@ -276,6 +346,11 @@ class _TaskEventHandler(adsk.core.CustomEventHandler):
                 task = _task_queue.get_nowait()
             except queue.Empty:
                 break
+            fname = getattr(task['func'], '__name__', '?')
+            verbose = fname not in ('_main_log', '_do_poll_and_push')
+            t0 = time.time()
+            if verbose:
+                _log("[TM] main thread start: {}".format(fname))
             try:
                 result = task['func'](*task.get('args', ()), **task.get('kwargs', {}))
                 task['result'] = result
@@ -284,6 +359,9 @@ class _TaskEventHandler(adsk.core.CustomEventHandler):
                 task['error'] = traceback.format_exc()
             finally:
                 task['done'].set()
+                if verbose:
+                    _log("[TM] main thread done: {} ({:.1f}s){}".format(
+                        fname, time.time() - t0, " ERROR" if task.get('error') else ""))
             count += 1
 
 def _call_main(func, *args, timeout=5.0):
@@ -374,70 +452,367 @@ def _get_design() -> Optional[Any]:
         return None
     return design
 
+def _m2l(m):
+    return [[m.getCell(i, j) for j in range(4)] for i in range(4)]
+
+def _l2m(a):
+    m = adsk.core.Matrix3D.create()
+    for i in range(4):
+        for j in range(4):
+            m.setCell(i, j, a[i][j])
+    return m
+
+def _mul(a, b):
+    return [[sum(a[i][k] * b[k][j] for k in range(4)) for j in range(4)] for i in range(4)]
+
+def _inv_rigid(a):
+    r = [[a[j][i] for j in range(3)] for i in range(3)]          # R^T
+    t = [a[0][3], a[1][3], a[2][3]]
+    out = [[r[i][0], r[i][1], r[i][2], -sum(r[i][k] * t[k] for k in range(3))] for i in range(3)]
+    out.append([0.0, 0.0, 0.0, 1.0])
+    return out
+
+_IDENT = [[1.0 if i == j else 0.0 for j in range(4)] for i in range(4)]
+
+def _board_mat():
+    for b in _board_occs:
+        try:
+            if b.isValid:
+                return _m2l(b.transform2)
+        except Exception:
+            pass
+    return _IDENT
+
+def _local(occ):
+    return _mul(_inv_rigid(_board_mat()), _m2l(occ.transform2))
+
 def _get_occ_transform(occ) -> Tuple[float, float, float, float]:
-    transform = occ.transform2
-    t = transform.translation
-    x = t.x
-    y = t.y
-    z = t.z
-    rot_z = math.degrees(math.atan2(transform.getCell(1, 0), transform.getCell(0, 0)))
-    return x, y, z, rot_z
+    """Position in the board's frame (cm) and rotation about the board normal (deg)."""
+    l = _local(occ)
+    return l[0][3], l[1][3], l[2][3], math.degrees(math.atan2(l[1][0], l[0][0]))
+
+def _get_world_xyz(occ) -> Tuple[float, float, float]:
+    t = occ.transform2.translation
+    return t.x, t.y, t.z
 
 def _set_occ_transform(occ, x_cm, y_cm, z_cm, rotation_deg) -> None:
-    transform = occ.transform2
-    transform.setToIdentity()
-    rad = math.radians(rotation_deg)
-    cos_r = math.cos(rad)
-    sin_r = math.sin(rad)
-    transform.setCell(0, 0, cos_r)
-    transform.setCell(0, 1, -sin_r)
-    transform.setCell(1, 0, sin_r)
-    transform.setCell(1, 1, cos_r)
-    transform.setCell(2, 2, 1.0)
-    transform.setCell(3, 3, 1.0)
-    transform.translation = adsk.core.Vector3D.create(x_cm, y_cm, z_cm)
-    occ.transform2 = transform
+    b = _board_mat()
+    l = _mul(_inv_rigid(b), _m2l(occ.transform2))
+    cur = math.degrees(math.atan2(l[1][0], l[0][0]))
+    d = math.radians(rotation_deg - cur)
+    c, s = math.cos(d), math.sin(d)
+    rz = [[c, -s, 0.0, 0.0], [s, c, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]]
+    l = _mul(rz, [row[:] for row in l])   # rotate about board Z, keeps flips/tilt
+    l[0][3], l[1][3], l[2][3] = x_cm, y_cm, z_cm
+    occ.transform2 = _l2m(_mul(b, l))
+
+def _rot(axis: str, deg: float):
+    a = math.radians(deg); c, s = math.cos(a), math.sin(a)
+    if axis == "x":
+        r = [[1, 0, 0], [0, c, -s], [0, s, c]]
+    elif axis == "y":
+        r = [[c, 0, s], [0, 1, 0], [-s, 0, c]]
+    else:
+        r = [[c, -s, 0], [s, c, 0], [0, 0, 1]]
+    return [[float(v) for v in row] + [0.0] for row in r] + [[0.0, 0.0, 0.0, 1.0]]
+
+def _optf(key: str) -> float:
+    try:
+        return float(_OPTS.get(key, 0) or 0)
+    except Exception:
+        return 0.0
+
+_ATTR_GROUP = "EasyEDA"
+
+def _placement_matrix():
+    """Up-axis turn, then user rotation X, Y, Z, then offset (mm). Board frame -> design."""
+    axis = _up_axis()
+    if axis == "auto":
+        try:
+            pref = _get_app().preferences.generalPreferences.defaultModelingOrientation
+            axis = "y" if pref == adsk.core.DefaultModelingOrientations.YUpModelingOrientation else "z"
+        except Exception:
+            axis = "z"
+    m = _rot("x", -90.0) if axis == "y" else [row[:] for row in _IDENT]
+    m = _mul(_rot("z", _optf("rotZ")), _mul(_rot("y", _optf("rotY")), _mul(_rot("x", _optf("rotX")), m)))
+    m[0][3] += _optf("offsetX") / 10.0
+    m[1][3] += _optf("offsetY") / 10.0
+    m[2][3] += _optf("offsetZ") / 10.0
+    return m, axis
+
+def _get_attr(occ, name):
+    try:
+        a = occ.attributes.itemByName(_ATTR_GROUP, name)
+        return a.value if a else None
+    except Exception:
+        return None
+
+def _set_attr(occ, name, value):
+    try:
+        occ.attributes.add(_ATTR_GROUP, name, value)   # add() overwrites an existing attribute
+    except Exception:
+        _log("Attribute write failed: " + traceback.format_exc()[:200])
+
+def _find_boards():
+    """Re-find boards tagged at import (after a Fusion/add-in restart)."""
+    global _board_occs
+    if any(getattr(b, "isValid", False) for b in _board_occs):
+        return
+    design = _get_design()
+    if not design:
+        return
+    found = []
+    try:
+        for a in design.findAttributes(_ATTR_GROUP, "board"):
+            o = adsk.fusion.Occurrence.cast(a.parent)
+            if o and o.isValid:
+                found.append(o)
+    except Exception:
+        _log("Board search failed: " + traceback.format_exc()[:200])
+    _board_occs = found
+    if found:
+        _log("Found tagged board(s): {}".format(", ".join(o.name for o in found)))
+
+def _place_board(initial: bool = True):
+    """Apply placement from the dialog. On re-apply, the previous placement is undone first,
+    so manual moves of the board in Fusion are kept."""
+    m, axis = _placement_matrix()
+    for b in _board_occs:
+        try:
+            w = _m2l(b.transform2)
+            if not initial:
+                old = _get_attr(b, "placement")
+                if old:
+                    w = _mul(_inv_rigid(json.loads(old)), w)
+            if not initial and _get_attr(b, "placement") == json.dumps(m):
+                continue
+            grounded = False
+            try:
+                grounded = b.isGrounded
+                if grounded:
+                    b.isGrounded = False      # a grounded occurrence ignores transform changes
+            except Exception:
+                pass
+            b.transform2 = _l2m(_mul(m, w))
+            design = _get_design()
+            if design and _is_parametric(design):
+                # Capture while ungrounded: Fusion drops pending moves of grounded occurrences.
+                made, removed = _capture_preserving(design, [], list(_board_occs), PLACEMENT_CAPTURE_NAME, True)
+                _log("Placement captured: {} ({} old replaced)".format(made, removed))
+            try:
+                if initial or grounded:
+                    b.isGrounded = True       # keep the board anchored in the design
+            except Exception:
+                _log("Grounding failed: " + traceback.format_exc()[:200])
+            _set_attr(b, "board", "1")
+            _set_attr(b, "placement", json.dumps(m))
+            _log("Board placed ({}-up, rot {}/{}/{} deg, offset {}/{}/{} mm): {}".format(
+                axis, _optf("rotX"), _optf("rotY"), _optf("rotZ"),
+                _optf("offsetX"), _optf("offsetY"), _optf("offsetZ"), b.name))
+        except Exception:
+            _log("Board placement failed: " + traceback.format_exc())
+
+def _reapply_placement():
+    _find_boards()
+    if not _board_occs:
+        _log("Placement: no board found in the active design (import first)")
+        return
+    _place_board(initial=False)
+
+def _resolve_occ(designator: str):
+    occ = _occ_objs.get(designator)
+    try:
+        if occ is not None and occ.isValid:
+            return occ
+    except Exception:
+        pass
+    occ_name = designator_map.get(designator)
+    design = _get_design()
+    if not occ_name or not design:
+        return None
+    occ = design.rootComponent.allOccurrences.itemByName(occ_name)
+    if occ:
+        _occ_objs[designator] = occ
+    return occ
+
+def _in_board(occ) -> bool:
+    live = []
+    for b in _board_occs:
+        try:
+            if b.isValid:
+                live.append(b)
+        except Exception:
+            pass
+    if not live:
+        return True
+    try:
+        fp = occ.fullPathName
+    except Exception:
+        return True
+    return any(fp == b.fullPathName or fp.startswith(b.fullPathName + "+") for b in live)
+
+def _capture_preserving(design, tops, extra_occs, name, single):
+    """Capture Position that survives replacing the previous capture and grounded tops.
+    Fusion facts (tested): a capture drops pending moves of a *grounded* occurrence, and
+    deleting an old capture reverts whatever it held. So: record world positions, unground,
+    delete old capture(s), restore positions, capture, re-ground."""
+    snaps = design.snapshots
+    occs = []
+    seen = set()
+    for o in list(tops) + list(extra_occs):
+        try:
+            if o is not None and o.isValid and o.fullPathName not in seen:
+                seen.add(o.fullPathName); occs.append(o)
+        except Exception:
+            pass
+    saved = [(o, o.transform2.copy()) for o in occs]
+    grounded = []
+    for t in tops:
+        try:
+            if t.isValid and t.isGrounded:
+                t.isGrounded = False; grounded.append(t)
+        except Exception:
+            pass
+    old = []
+    if single:
+        for i in range(snaps.count):
+            s = snaps.item(i)
+            try:
+                if s.timelineObject.name.startswith(name):
+                    old.append(s)
+            except Exception:
+                pass
+    for s in old:
+        s.deleteMe()
+    if old:
+        for o, m in saved:          # parents first (tops are listed first)
+            try:
+                o.transform2 = m
+            except Exception:
+                pass
+    made = False
+    if snaps.hasPendingSnapshot:
+        new = snaps.add()
+        try:
+            new.timelineObject.name = name
+        except Exception:
+            pass
+        made = True
+    for t in grounded:
+        t.isGrounded = True
+    return made, len(old)
+
+def _is_parametric(design) -> bool:
+    try:
+        return design.designType == adsk.fusion.DesignTypes.ParametricDesignType
+    except Exception:
+        return False
+
+def _maybe_capture(force: bool = False):
+    """Main thread: capture pending part positions in a parametric design."""
+    if _capture_mode() == "off":
+        return
+    if not force:
+        delay = _capture_delay()
+        if delay <= 0 or time.time() - _last_move_time < delay - 0.05:
+            return
+    design = _get_design()
+    try:
+        if design and _is_parametric(design) and design.snapshots.hasPendingSnapshot:
+            made, removed = _capture_preserving(design, [], list(_occ_objs.values()),
+                                                CAPTURE_NAME, _single_capture())
+            _log("Positions captured: {} ({} old capture(s) replaced)".format(made, removed))
+    except Exception:
+        _log("Capture failed: " + traceback.format_exc())
+
+def _schedule_capture():
+    global _last_move_time
+    delay = _capture_delay()
+    if delay <= 0:
+        return
+    _last_move_time = time.time()
+    t = threading.Timer(delay, lambda: _call_main_fire(_maybe_capture))
+    t.daemon = True
+    t.start()
 
 def _import_step(filepath: str) -> bool:
-    global _imported_design
+    global _imported_design, _board_occs
     app = _get_app()
     if not app:
         _log("No app")
         return False
-    # 新建一个 Fusion 设计文档
+    _log("Import: file {} ({:.1f} MB)".format(filepath, os.path.getsize(filepath) / 1e6))
+    im = app.importManager
+    design = adsk.fusion.Design.cast(app.activeProduct) if _import_active() else None
+    new_doc = design is None
     try:
-        doc = app.documents.add(adsk.core.DocumentTypes.FusionDesignDocumentType)
-        if doc:
-            doc.activate()
-            _log("Created new design document")
-    except Exception:
-        _log("Create document failed, using current: " + traceback.format_exc()[:200])
-    # 导入 STEP
-    try:
-        result = app.executeTextCommand('Translator.Import {}'.format(filepath))
-        _log("Import result: {}".format((result or '')[:200]))
+        opts = im.createSTEPImportOptions(filepath)
+        if not new_doc:
+            _log("Import: into active design '{}'".format(app.activeDocument.name))
+            occs = None
+            # Fusion treats the first component in a design as anchored: a Capture Position drops
+            # its own move (only its children keep theirs). Make sure the board is never first.
+            spacer = None
+            if design.rootComponent.occurrences.count == 0:
+                spacer = design.rootComponent.occurrences.addNewComponent(adsk.core.Matrix3D.create())
+                spacer.component.name = "EasyEDA temp"
+            try:
+                occs = im.importToTarget2(opts, design.rootComponent)
+            except AttributeError:
+                before = set(design.rootComponent.occurrences.item(i).entityToken
+                             for i in range(design.rootComponent.occurrences.count))
+                im.importToTarget(opts, design.rootComponent)
+                occs = [o for o in design.rootComponent.occurrences if o.entityToken not in before]
+            finally:
+                if spacer is not None:
+                    try:
+                        spacer.deleteMe()
+                    except Exception:
+                        _log("Temp component delete failed: " + traceback.format_exc()[:200])
+            _board_occs = [occs.item(i) for i in range(occs.count)] if hasattr(occs, 'count') else list(occs or [])
+            _log("Import: {} top-level occurrence(s): {}".format(
+                len(_board_occs), ", ".join(o.name for o in _board_occs)))
+            _place_board()
+        else:
+            _log("Import: importToNewDocument...")
+            doc = im.importToNewDocument(opts)
+            design = adsk.fusion.Design.cast(doc.products.itemByProductType('DesignProductType')) if doc else None
+            if not design:
+                design = adsk.fusion.Design.cast(app.activeProduct)
+            _board_occs = []
+            if design:
+                root_occs = design.rootComponent.occurrences
+                if root_occs.count == 1:          # single top assembly = the board
+                    _board_occs = [root_occs.item(0)]
+                    try:
+                        if design.designType != adsk.fusion.DesignTypes.DirectDesignType:
+                            design.designType = adsk.fusion.DesignTypes.DirectDesignType
+                            _log("Switched to Direct Design mode")
+                    except Exception:
+                        _log("Direct mode switch failed: " + traceback.format_exc()[:200])
+                    _place_board()
+                else:
+                    _log("New document: {} root occurrences, placement skipped".format(root_occs.count))
     except Exception:
         _log("Import failed: " + traceback.format_exc())
         return False
-    time.sleep(3)
-    try:
-        design = app.activeProduct
-        if design and isinstance(design, adsk.fusion.Design):
-            _imported_design = design
-            # 切换到直接设计模式
-            try:
-                if design.designType != adsk.fusion.DesignTypes.DirectDesignType:
-                    design.designType = adsk.fusion.DesignTypes.DirectDesignType
-                    _log("Switched to Direct Design mode")
-            except Exception:
-                pass
-            occs = design.rootComponent.allOccurrences.count
-            _log("Design OK: {} occs".format(occs))
-            return occs > 0
-    except Exception:
-        pass
-    _log("No design after import")
-    return False
+    if not design:
+        _log("No design after import")
+        return False
+    _imported_design = design
+    if new_doc:
+        try:
+            if design.designType != adsk.fusion.DesignTypes.DirectDesignType:
+                design.designType = adsk.fusion.DesignTypes.DirectDesignType
+                _log("Switched to Direct Design mode")
+        except Exception:
+            _log("Direct mode switch failed: " + traceback.format_exc()[:200])
+    occs = design.rootComponent.allOccurrences.count
+    _log("Design OK: {} occs".format(occs))
+    return occs > 0
+
+def _force_capture():
+    _maybe_capture(force=True)
 
 def _match_designator(short_name: str, designator: str) -> bool:
     if not short_name or not designator:
@@ -454,7 +829,9 @@ def _do_build_mapping(components: List[dict]) -> List[dict]:
     design = _get_design()
     if not design:
         return []
+    _find_boards()
     _initial_offsets.clear()
+    _occ_objs.clear()
     mapping = []
     root = design.rootComponent
     all_occs = root.allOccurrences
@@ -466,13 +843,14 @@ def _do_build_mapping(components: List[dict]) -> List[dict]:
         for i in range(all_occs.count):
             o = all_occs.item(i)
             short_name = o.name.split(":")[0].strip()
-            if _match_designator(short_name, designator):
+            if _match_designator(short_name, designator) and _in_board(o):
                 occ = o
                 break
         if occ:
             occ_name = occ.name
             short = occ_name.split(":")[0].strip()
             designator_map[designator] = occ_name
+            _occ_objs[designator] = occ
             name_to_designator[short] = designator
             mapping.append({"designator": designator, "fusion360Name": short})
             fx, fy, fz, frot = _get_occ_transform(occ)
@@ -484,13 +862,7 @@ def _do_build_mapping(components: List[dict]) -> List[dict]:
     return mapping
 
 def _do_position_update(designator: str, x_mm: float, y_mm: float, rotation: float) -> None:
-    occ_name = designator_map.get(designator)
-    if not occ_name:
-        return
-    design = _get_design()
-    if not design:
-        return
-    occ = design.rootComponent.allOccurrences.itemByName(occ_name)
+    occ = _resolve_occ(designator)
     if not occ:
         return
     offset = _initial_offsets.get(designator)
@@ -508,8 +880,9 @@ def _do_position_update(designator: str, x_mm: float, y_mm: float, rotation: flo
         _set_occ_transform(occ, new_fx, new_fy, new_fz, new_rot)
         rx, ry, rz, rrot = _get_occ_transform(occ)
         _last_positions[designator] = (rx * 10.0, ry * 10.0, rrot)
+        _schedule_capture()
     except Exception:
-        _log("[position] failed: {}".format(traceback.format_exc()[:200]))
+        _log("[position] failed: {}".format(traceback.format_exc()))
 
 def _snapshot_positions():
     global _last_positions
@@ -519,7 +892,7 @@ def _snapshot_positions():
     root = design.rootComponent
     for designator, occ_name in designator_map.items():
         try:
-            occ = root.allOccurrences.itemByName(occ_name)
+            occ = _resolve_occ(designator)
             if occ:
                 x, y, z, rot = _get_occ_transform(occ)
                 _last_positions[designator] = (x * 10.0, y * 10.0, rot)
@@ -528,15 +901,10 @@ def _snapshot_positions():
 
 def _do_cross_probe(designator: str) -> None:
     occ_name = designator_map.get(designator)
-    if not occ_name:
-        return
-    design = _get_design()
-    if not design:
-        return
-    occ = design.rootComponent.allOccurrences.itemByName(occ_name)
+    occ = _resolve_occ(designator)
     if not occ:
         return
-    x, y, z, _ = _get_occ_transform(occ)
+    x, y, z = _get_world_xyz(occ)
     app = _get_app()
     if not app:
         return
@@ -581,14 +949,15 @@ def _restore_highlight(occ_name, original_opacity):
 
 def _do_delete_object(designator: str) -> None:
     _log("[DELETE-F360] 开始: designator={}".format(designator))
+    occ = _resolve_occ(designator)
     occ_name = designator_map.pop(designator, None)
+    _occ_objs.pop(designator, None)
     if not occ_name:
         _log("[DELETE-F360] 未找到映射: {}".format(designator))
         return
     design = _get_design()
     if not design:
         return
-    occ = design.rootComponent.allOccurrences.itemByName(occ_name)
     if not occ:
         _log("[DELETE-F360] occ不存在: {}".format(occ_name))
         name_to_designator.pop(occ_name.split(":")[0].strip(), None)
@@ -662,7 +1031,7 @@ def _do_poll_positions() -> List[dict]:
     deleted_designators = []
     for designator, occ_name in list(designator_map.items()):
         try:
-            occ = root.allOccurrences.itemByName(occ_name)
+            occ = _resolve_occ(designator)
             if not occ:
                 # occurrence 不存在了，说明在 Fusion360 里被删除了
                 _log("[轮询-删除检测] {} 的 occ '{}' 不存在了，通知EDA删除".format(designator, occ_name))
@@ -724,7 +1093,7 @@ def _check_selection() -> list:
                 _log("[选中] {} -> {}".format(nm, des))
                 # 获取元件位置用于导航
                 occ_name = designator_map.get(des)
-                occ = design.rootComponent.allOccurrences.itemByName(occ_name) if occ_name else None
+                occ = _resolve_occ(des) if occ_name else None
                 x_mm, y_mm, rot = 0, 0, 0
                 if occ:
                     try:
@@ -759,10 +1128,22 @@ async def _handle_message(raw_message):
     try:
         message = json.loads(raw_message)
         msg_type = message.get("type", "")
+        if isinstance(message.get("options"), dict):
+            _OPTS.update(message["options"])
+            _log("Options: {}".format(_OPTS))
+            if msg_type == "set_options":
+                _call_main_fire(_reapply_placement)
         if msg_type == "ping":
             await _send_to_client({"type": "pong"})
         elif msg_type == "file_upload_start":
             session_id = message["sessionId"]
+            if _importing:
+                _log("Upload rejected: an import is already running")
+                await _send_to_client({"type": "error", "message": "Import already running in Fusion, ignored duplicate export"})
+                return
+            if upload_sessions:
+                _log("New upload supersedes {} unfinished upload(s)".format(len(upload_sessions)))
+                upload_sessions.clear()
             upload_sessions[session_id] = {
                 "filename": message["filename"],
                 "totalSize": message["totalSize"],
@@ -796,6 +1177,7 @@ async def _handle_message(raw_message):
             _log("Monitor enabled")
         elif msg_type == "disable_monitor":
             monitor_enabled = False
+            _call_main_fire(_force_capture)
             _last_positions.clear()
             _stop_poll_timer()
             _log("Monitor disabled")
@@ -828,20 +1210,30 @@ async def handle_client(websocket):
     finally:
         monitor_enabled = False
         _active_client = None
+        _call_main_fire(_force_capture)
         _log("Client disconnected")
 
 async def _process_upload(session_id: str) -> None:
+    global _importing
+    _importing = True
+    try:
+        await _process_upload_inner(session_id)
+    finally:
+        _importing = False
+
+async def _process_upload_inner(session_id: str) -> None:
     _log(f"=== 文件上传处理开始 ===")
     session = upload_sessions.pop(session_id, None)
     if not session:
         _log("错误: 上传会话不存在")
         return
     await _send_to_client({"type": "upload_complete", "sessionId": session_id})
-    all_data = b""
-    for i in range(session["totalChunks"]):
-        chunk_b64 = session["chunks"].get(i)
-        if chunk_b64:
-            all_data += base64.b64decode(chunk_b64)
+    missing = [i for i in range(session["totalChunks"]) if i not in session["chunks"]]
+    if missing:
+        _log("WARNING: missing chunks: {}".format(missing[:20]))
+    all_data = b"".join(base64.b64decode(session["chunks"][i])
+                        for i in range(session["totalChunks"]) if i in session["chunks"])
+    _log("Upload assembled: {:.1f} MB, firing import".format(len(all_data) / 1e6))
     filename = session["filename"]
     filepath = os.path.join(TEMP_DIR, "easyeda_{}".format(filename))
     try:
@@ -851,7 +1243,7 @@ async def _process_upload(session_id: str) -> None:
         _log(f"文件保存失败: {e}")
         return
     await _send_to_client({"type": "import_started", "sessionId": session_id})
-    success = await _call_main_await(_import_step, filepath, timeout=60.0)
+    success = await _call_main_await(_import_step, filepath, timeout=600.0)
     if success:
         await _send_to_client({
             "type": "import_complete",
@@ -859,9 +1251,10 @@ async def _process_upload(session_id: str) -> None:
             "details": "success {}".format(filename),
         })
     else:
-        await _send_to_client({"type": "error", "message": "fail"})
+        await _send_to_client({"type": "error", "message": "fail - see ~/easyeda_fusion.log"})
     try:
-        os.remove(filepath)
+        if success:
+            os.remove(filepath)
     except Exception:
         pass
 
@@ -875,10 +1268,15 @@ def _start_ws_thread():
     asyncio.set_event_loop(_ws_loop)
     try:
         _ws_loop.run_until_complete(_run_server())
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, asyncio.CancelledError):
         _log("Server stopped")
+    except BaseException:
+        _log("Server error: " + traceback.format_exc())
     finally:
-        _ws_loop.close()
+        try:
+            _ws_loop.close()
+        except Exception:
+            pass
 
 # ==================== 主线程定时推送（替代 HTTP 轮询）====================
 
@@ -931,9 +1329,10 @@ def run(context):
         _log("CustomEvent registered: {}".format(_custom_event_id))
     else:
         _log("WARNING: app not available")
-    ws_thread = threading.Thread(target=_start_ws_thread, daemon=True)
-    ws_thread.start()
-    _log("Add-in started")
+    global _ws_thread
+    _ws_thread = threading.Thread(target=_start_ws_thread, daemon=True, name="easyeda-ws")
+    _ws_thread.start()
+    _log("Add-in started, version {}".format(ADDIN_VERSION))
 
 def stop(context):
     global monitor_enabled, _active_client, _imported_design
@@ -950,7 +1349,31 @@ def stop(context):
     except Exception:
         pass
     monitor_enabled = False
+    # shut down the WebSocket server and client so the port is released
+    try:
+        loop = _ws_loop
+        if loop is not None and loop.is_running():
+            def _shutdown():
+                try:
+                    if _active_client is not None:
+                        _active_client._closed = True
+                        _active_client._writer.close()
+                except Exception:
+                    pass
+                try:
+                    if _ws_server is not None:
+                        _ws_server.close()
+                except Exception:
+                    pass
+            loop.call_soon_threadsafe(_shutdown)
+        if _ws_thread is not None:
+            _ws_thread.join(timeout=3.0)
+            _log("WebSocket thread alive after stop: {}".format(_ws_thread.is_alive()))
+    except Exception:
+        _log("WS shutdown error: " + traceback.format_exc()[:200])
     _imported_design = None
+    _board_occs.clear()
+    _occ_objs.clear()
     _active_client = None
     designator_map.clear()
     name_to_designator.clear()

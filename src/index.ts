@@ -16,6 +16,78 @@ let activeUploadSessionId: string | null = null;
 const CHUNK_SIZE = 512 * 1024; // 512KB per chunk
 const STORAGE_KEY_BIDIRECTIONAL = 'fusion360_bidirectional';
 
+// ==================== 导出设置 (settings dialog) ====================
+const STORAGE_KEY_OPTIONS = 'fusion360_options';
+const STORAGE_KEY_DIALOG_MODE = 'fusion360_dialog_mode';
+const SETTINGS_IFRAME_ID = 'fusion360-settings';
+const SETTINGS_TOPIC = 'fusion360-settings-result';
+const STORAGE_KEY_DIALOG_NONCE = 'fusion360_dialog_nonce';
+
+interface FusionOptions {
+    importMode: 'new' | 'active';
+    upAxis: 'auto' | 'y' | 'z';
+    captureMode: 'end' | 'auto' | 'off';
+    captureDelay: number;
+    singleCapture: boolean;
+    askOnExport: boolean;
+    offsetX: number; offsetY: number; offsetZ: number;
+    rotX: number; rotY: number; rotZ: number;
+}
+const DEFAULT_OPTIONS: FusionOptions = {
+    importMode: 'active', upAxis: 'auto', captureMode: 'end', captureDelay: 3, singleCapture: true, askOnExport: true,
+    offsetX: 0, offsetY: 0, offsetZ: 0, rotX: 0, rotY: 0, rotZ: 0,
+};
+
+function getOptions(): FusionOptions {
+    try {
+        const stored = eda.sys_Storage.getExtensionUserConfig(STORAGE_KEY_OPTIONS);
+        return { ...DEFAULT_OPTIONS, ...(stored && typeof stored === 'object' ? stored : {}) };
+    }
+    catch {
+        return { ...DEFAULT_OPTIONS };
+    }
+}
+
+/** Options sent to the Fusion add-in (askOnExport is EasyEDA-only). */
+function fusionOptions(): Omit<FusionOptions, 'askOnExport'> {
+    const { askOnExport: _ask, ...rest } = getOptions();
+    return rest;
+}
+
+let settingsSubscribed = false;
+function ensureSettingsSubscription(): void {
+    if (settingsSubscribed)
+        return;
+    settingsSubscribed = true;
+    eda.sys_MessageBus.subscribe(SETTINGS_TOPIC, (msg: any) => {
+        // EasyEDA may run several instances of this extension script, each with its own
+        // subscription. The nonce (shared storage) makes sure only one of them acts.
+        const nonce = eda.sys_Storage.getExtensionUserConfig(STORAGE_KEY_DIALOG_NONCE);
+        if (!msg || !msg.nonce || msg.nonce !== nonce)
+            return;
+        eda.sys_Storage.setExtensionUserConfig(STORAGE_KEY_DIALOG_NONCE, '');
+        if (msg.action === 'cancel')
+            return;
+        if (msg.options)
+            eda.sys_Storage.setExtensionUserConfig(STORAGE_KEY_OPTIONS, { ...DEFAULT_OPTIONS, ...msg.options });
+        if (msg.action === 'export')
+            void doExportToFusion360();
+        else if (wsReady)
+            sendToFusion360({ type: 'set_options', options: fusionOptions() });
+    });
+}
+
+async function openSettingsDialog(mode: 'export' | 'save'): Promise<void> {
+    ensureSettingsSubscription();
+    eda.sys_Storage.setExtensionUserConfig(STORAGE_KEY_DIALOG_MODE, mode);
+    eda.sys_Storage.setExtensionUserConfig(STORAGE_KEY_DIALOG_NONCE, Date.now().toString(36) + Math.random().toString(36).slice(2));
+    await eda.sys_IFrame.openIFrame('/iframe/settings.html', 500, 780, SETTINGS_IFRAME_ID, { title: eda.sys_I18n.text('Fusion 360 导出设置') });
+}
+
+export async function fusion360Settings(): Promise<void> {
+    await openSettingsDialog('save');
+}
+
 function isBidirectionalEnabled(): boolean {
     return eda.sys_Storage.getExtensionUserConfig(STORAGE_KEY_BIDIRECTIONAL) === true;
 }
@@ -54,7 +126,7 @@ async function connectToFusion360Async(): Promise<void> {
                 console.log(`[连接] 连接成功, ${stateSnapshot()}`);
                 if (isBidirectionalEnabled()) {
                     console.log(`[连接] 恢复Fusion360端监听`);
-                    sendToFusion360({ type: 'enable_monitor' });
+                    sendToFusion360({ type: 'enable_monitor', options: fusionOptions() });
                 }
                 resolve();
             });
@@ -75,7 +147,7 @@ export function connectFusion360(): void {
             console.log(`[连接] 连接成功, ${stateSnapshot()}`);
             if (isBidirectionalEnabled()) {
                 console.log(`[连接] 恢复Fusion360端监听`);
-                sendToFusion360({ type: 'enable_monitor' });
+                sendToFusion360({ type: 'enable_monitor', options: fusionOptions() });
             }
             eda.sys_Message.showToastMessage(eda.sys_I18n.text('成功连接到Fusion360服务器!'), ESYS_ToastMessageType.SUCCESS);
         });
@@ -186,6 +258,7 @@ async function sendFileChunked(buffer: ArrayBuffer, filename: string): Promise<v
         filename,
         totalSize,
         totalChunks,
+        options: fusionOptions(),
     });
 
     await new Promise(r => setTimeout(r, 50));
@@ -216,6 +289,18 @@ async function sendFileChunked(buffer: ArrayBuffer, filename: string): Promise<v
 // ==================== 导出 ====================
 
 export async function exportToFusion360(): Promise<void> {
+    if (isExporting) {
+        eda.sys_Message.showToastMessage(eda.sys_I18n.text('正在导出中，请稍候...'), ESYS_ToastMessageType.INFO);
+        return;
+    }
+    if (getOptions().askOnExport) {
+        await openSettingsDialog('export');
+        return;
+    }
+    await doExportToFusion360();
+}
+
+async function doExportToFusion360(): Promise<void> {
     if (isExporting) {
         eda.sys_Message.showToastMessage(eda.sys_I18n.text('正在导出中，请稍候...'), ESYS_ToastMessageType.INFO);
         return;
@@ -363,7 +448,7 @@ export async function enableBidirectional(): Promise<void> {
 
     sendToFusion360({ type: 'build_mapping', components: componentData });
     console.log(`[双向] build_mapping 已发送 (${componentData.length} 个元件)`);
-    sendToFusion360({ type: 'enable_monitor' });
+    sendToFusion360({ type: 'enable_monitor', options: fusionOptions() });
     console.log(`[双向] enable_monitor 已发送`);
     startFusionPolling();
 
@@ -384,7 +469,7 @@ export function disableBidirectional(): void {
     try { eda.pcb_Event.removeEventListener(BIDIRECTIONAL_LISTENER_ID); } catch {}
     try { eda.pcb_Event.removeEventListener(BIDIRECTIONAL_MOUSE_ID); } catch {}
 
-    sendToFusion360({ type: 'disable_monitor' });
+    sendToFusion360({ type: 'disable_monitor', options: fusionOptions() });
 
     designatorToPrimitiveId.clear();
     primitiveIdToDesignator.clear();

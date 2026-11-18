@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<title>Fusion 360 export settings</title>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+		<style>
+			body { font: 12px/1.3 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 0; padding: 8px 12px; color: #222; }
+			fieldset { border: 1px solid #ddd; border-radius: 6px; margin: 0 0 6px; padding: 4px 10px 6px; }
+			legend { font-weight: 600; padding: 0 4px; }
+			label { display: block; margin: 2px 0; cursor: pointer; }
+			.hint { color: #888; font-size: 11px; margin: 0 0 2px 22px; }
+			.row { display: flex; align-items: center; gap: 8px; margin: 6px 0 0 22px; }
+			#captureDelay { width: 50px; }
+			.buttons { display: flex; justify-content: flex-end; gap: 8px; margin-top: 8px; }
+			button { padding: 5px 14px; border-radius: 4px; border: 1px solid #bbb; background: #f5f5f5; cursor: pointer; }
+			button.primary { background: #1677ff; border-color: #1677ff; color: #fff; }
+			.grid { display: grid; grid-template-columns: 90px repeat(3, 70px); gap: 4px 6px; align-items: center; }
+			.grid input { width: 64px; }
+			#err { color: #c00; display: none; margin-top: 8px; }
+		</style>
+	</head>
+	<body>
+		<fieldset>
+			<legend>Import target</legend>
+			<label><input type="radio" name="importMode" value="new" /> New Fusion document</label>
+			<div class="hint">Much faster and cleaner. Own document, Direct Design mode.</div>
+			<label><input type="radio" name="importMode" value="active" /> Into the active Fusion design</label>
+			<div class="hint">Added as one component, keeps your timeline. Slow for large boards (minutes).</div>
+		</fieldset>
+
+		<fieldset>
+			<legend>Up axis in Fusion</legend>
+			<label><input type="radio" name="upAxis" value="auto" /> Auto (Fusion preference)</label>
+			<label><input type="radio" name="upAxis" value="y" /> Y up (rotate board so its top faces +Y)</label>
+			<label><input type="radio" name="upAxis" value="z" /> Z up (as exported, same as EasyEDA)</label>
+		</fieldset>
+
+		<fieldset>
+			<legend>Board placement (Fusion axes)</legend>
+			<div class="grid">
+				<span></span><span>X</span><span>Y</span><span>Z</span>
+				<span>Offset (mm)</span>
+				<input type="text" inputmode="decimal" id="offsetX" /><input type="text" inputmode="decimal" id="offsetY" /><input type="text" inputmode="decimal" id="offsetZ" />
+				<span>Rotation (°)</span>
+				<input type="text" inputmode="decimal" id="rotX" /><input type="text" inputmode="decimal" id="rotY" /><input type="text" inputmode="decimal" id="rotZ" />
+			</div>
+			<div class="hint" style="margin-left:0">After the up-axis turn: rotate X→Y→Z about the origin, then offset. Save re-applies it to an already imported board.</div>
+		</fieldset>
+
+		<fieldset>
+			<legend>Capture Position (parametric designs)</legend>
+			<label><input type="radio" name="captureMode" value="end" /> Once, when sync stops</label>
+			<label><input type="radio" name="captureMode" value="auto" /> After a pause in moves</label>
+			<div class="row">Delay <input type="text" inputmode="decimal" id="captureDelay" /> s</div>
+			<label><input type="radio" name="captureMode" value="off" /> Never (I capture myself)</label>
+			<label style="margin-top:8px"><input type="checkbox" id="singleCapture" /> Keep a single capture (replace the previous one)</label>
+		</fieldset>
+
+		<label><input type="checkbox" id="askOnExport" /> Show this dialog on every export</label>
+		<div class="hint" style="margin-left:22px">If off, change settings from the menu: Fusion 360 export settings.</div>
+
+		<div id="err">Cannot reach the EasyEDA API from this dialog.</div>
+		<div class="buttons">
+			<button id="cancel">Cancel</button>
+			<button id="save">Save</button>
+			<button id="export" class="primary">Export</button>
+		</div>
+
+		<script>
+			const KEY = 'fusion360_options';
+			const MODE_KEY = 'fusion360_dialog_mode';
+			const TOPIC = 'fusion360-settings-result';
+			const DEFAULTS = { importMode: 'active', upAxis: 'auto', captureMode: 'end', captureDelay: 3, singleCapture: true, askOnExport: true,
+				offsetX: 0, offsetY: 0, offsetZ: 0, rotX: 0, rotY: 0, rotZ: 0 };
+			const NUMS = ['offsetX', 'offsetY', 'offsetZ', 'rotX', 'rotY', 'rotZ'];
+			const api = (typeof eda !== 'undefined') ? eda : (window.parent && window.parent.eda);
+			if (!api) document.getElementById('err').style.display = 'block';
+
+			let opts = { ...DEFAULTS };
+			let mode = 'export';
+			let nonce = '';
+			try {
+				opts = { ...DEFAULTS, ...(api.sys_Storage.getExtensionUserConfig(KEY) || {}) };
+				mode = api.sys_Storage.getExtensionUserConfig(MODE_KEY) || 'export';
+				nonce = api.sys_Storage.getExtensionUserConfig('fusion360_dialog_nonce') || '';
+			} catch (e) {}
+
+			const setRadio = (n, v) => { const el = document.querySelector(`input[name=${n}][value="${v}"]`); if (el) el.checked = true; };
+			const num = (id, d) => { const v = parseFloat(String(document.getElementById(id).value).trim().replace(',', '.')); return Number.isFinite(v) ? v : d; };
+			const getRadio = n => (document.querySelector(`input[name=${n}]:checked`) || {}).value;
+			setRadio('importMode', opts.importMode);
+			setRadio('upAxis', opts.upAxis);
+			setRadio('captureMode', opts.captureMode);
+			document.getElementById('captureDelay').value = opts.captureDelay;
+			document.getElementById('singleCapture').checked = !!opts.singleCapture;
+			document.getElementById('askOnExport').checked = !!opts.askOnExport;
+			NUMS.forEach(k => { document.getElementById(k).value = opts[k] || 0; });
+			if (mode !== 'export') document.getElementById('export').style.display = 'none';
+
+			const sync = () => { document.getElementById('captureDelay').disabled = getRadio('captureMode') !== 'auto'; };
+			document.querySelectorAll('input[name=captureMode]').forEach(el => el.addEventListener('change', sync));
+			sync();
+
+			function collect() {
+				const nums = {};
+				NUMS.forEach(k => { nums[k] = num(k, 0); });
+				return {
+					...nums,
+					importMode: getRadio('importMode') || DEFAULTS.importMode,
+					upAxis: getRadio('upAxis') || DEFAULTS.upAxis,
+					captureMode: getRadio('captureMode') || DEFAULTS.captureMode,
+					captureDelay: Math.max(0.5, num('captureDelay', DEFAULTS.captureDelay)),
+					singleCapture: document.getElementById('singleCapture').checked,
+					askOnExport: document.getElementById('askOnExport').checked,
+				};
+			}
+			function finish(action) {
+				try { api.sys_MessageBus.publish(TOPIC, { action, nonce, options: action === 'cancel' ? null : collect() }); }
+				catch (e) { document.getElementById('err').style.display = 'block'; return; }
+				try { api.sys_IFrame.closeIFrame('fusion360-settings'); } catch (e) {}
+			}
+
+			// ---- i18n: translate text nodes when EasyEDA runs in Chinese ----
+			const ZH = {"Import target": "导入目标", "New Fusion document": "新建 Fusion 文档", "Much faster and cleaner. Own document, Direct Design mode.": "速度快得多、更整洁。独立文档，直接建模模式。", "Into the active Fusion design": "导入到当前 Fusion 设计", "Added as one component, keeps your timeline. Slow for large boards (minutes).": "作为一个组件加入，保留时间线。大板子较慢（数分钟）。", "Up axis in Fusion": "Fusion 中的向上轴", "Auto (Fusion preference)": "自动（跟随 Fusion 首选项）", "Y up (rotate board so its top faces +Y)": "Y 轴向上（旋转板子使顶面朝向 +Y）", "Z up (as exported, same as EasyEDA)": "Z 轴向上（保持导出方向，与 EDA 相同）", "Board placement (Fusion axes)": "板子放置（Fusion 坐标轴）", "Offset (mm)": "偏移 (mm)", "Rotation (°)": "旋转 (°)", "After the up-axis turn: rotate X→Y→Z about the origin, then offset. Save re-applies it to an already imported board.": "在向上轴旋转之后：绕原点依次旋转 X→Y→Z，然后偏移。点击保存会重新应用到已导入的板子。", "Capture Position (parametric designs)": "捕获位置（参数化设计）", "Once, when sync stops": "同步停止时捕获一次", "After a pause in moves": "移动停顿后捕获", "Delay": "延迟", "s": "秒", "Never (I capture myself)": "从不（我自己捕获）", "Keep a single capture (replace the previous one)": "只保留一个捕获（替换之前的捕获）", "Show this dialog on every export": "每次导出时显示此对话框", "If off, change settings from the menu: Fusion 360 export settings.": "关闭后，可通过菜单修改设置：导出设置。", "Cannot reach the EasyEDA API from this dialog.": "此对话框无法访问 EDA 接口。", "Cancel": "取消", "Save": "保存", "Export": "导出"};
+			function translate(dict) {
+				const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+				const nodes = [];
+				while (walker.nextNode()) nodes.push(walker.currentNode);
+				nodes.forEach(n => {
+					const t = n.nodeValue.trim();
+					if (t && dict[t]) n.nodeValue = n.nodeValue.replace(t, dict[t]);
+				});
+			}
+			try {
+				Promise.resolve(api.sys_I18n.getCurrentLanguage()).then(lang => {
+					if (String(lang || '').toLowerCase().startsWith('zh')) translate(ZH);
+				}).catch(() => {});
+			} catch (e) {}
+			document.getElementById('cancel').onclick = () => finish('cancel');
+			document.getElementById('save').onclick = () => finish('save');
+			document.getElementById('export').onclick = () => finish('export');
+		</script>
+	</body>
+</html>

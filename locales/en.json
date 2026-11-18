@@ -32,5 +32,6 @@
 	"Fusion360连接状态": "Fusion360 connection status",
 	"脚本内容为空": "Script content is empty",
 	"Fusion360脚本已保存，请在Fusion360中通过“脚本和Add-In”面板加载运行": "Fusion360 script saved, please load it via the “Scripts and Add-Ins” panel in Fusion360",
-	"保存脚本失败": "Failed to save script"
+	"保存脚本失败": "Failed to save script",
+	"Fusion 360 导出设置": "Fusion 360 export settings"
 }
