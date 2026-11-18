@@ -2,6 +2,25 @@
 
 # Fusion360 MCAD Integration — EasyEDA Pro Extension
 
+> ## What's new in 1.2.7
+> **Fixes**
+> - **STEP import no longer times out ([#2](https://github.com/easyeda/eext-mcad-integration-with-fusion360/issues/2))**: the add-in uses Fusion's documented `importManager` API instead of the `Translator.Import` text command
+> - **All Fusion API calls run on Fusion's main thread**, including logging; the log is also written to `~/easyeda_fusion.log`
+> - **Stop/Run works**: stopping the add-in shuts down the WebSocket server and frees port 8767
+> - **Localhost only**: the server listens on `127.0.0.1` instead of `0.0.0.0`
+> - **Faster uploads** for large boards; one click can no longer start two exports
+> - **Bottom-side parts stay flipped** when moved
+> - **Correct board placement with Capture Position**: works around Fusion anchoring the first component of a design
+>
+> **New**
+> - **Export settings dialog** (Chinese/English) on export, or from the menu **Fusion 360 export settings**
+> - **Import into the active Fusion design** (e.g. your enclosure), keeping its timeline, or into a new document (much faster)
+> - **Y-up / Z-up**, board **offset and rotation**; **Save** re-places an already imported board
+> - **Capture Position** when sync stops, after a pause, or never; optionally a single capture
+> - Moves work after the board is moved or rotated inside an enclosure, and after restarting Fusion
+>
+> Update both parts: import the new extension package in EasyEDA and replace the Fusion script with `script/Interactive-with-fusion.py`. See [Export settings](#export-settings) and the [changelog](CHANGELOG.md).
+
 Real-time collaboration between EasyEDA Pro and Fusion360 over a local WebSocket. Supports model export (into a new document or into your existing design), bidirectional position sync, cross-probe, and deletion sync.
 
 > Tested on macOS with Fusion (November 2026 builds). Nothing in the code is platform-specific, but Windows reports are welcome.
