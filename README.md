@@ -2,17 +2,9 @@
 
 # Fusion360 机电协同 —— 嘉立创 EDA 专业版扩展
 
-> ## 1.1.3 修复内容
-> - **STEP 导入不再超时（[#2](https://github.com/easyeda/eext-mcad-integration-with-fusion360/issues/2)）**：附加模块改用 Fusion 官方 `importManager` API，替代 `Translator.Import` 文本命令
-> - **日志线程安全**，并同时写入 `~/easyeda_fusion.log`
-> - **停止/运行可用**：停止附加模块时关闭 WebSocket 服务器并释放端口 8767
-> - **仅监听本机**：服务器绑定 `127.0.0.1` 而不是 `0.0.0.0`
-> - **大板子上传更快**，且不会重复导入
-> - **移动元件时底层元件保持翻转**
->
-> 只修改了 Fusion 附加模块：用 `script/Interactive-with-fusion.py` 替换 Fusion 中的脚本即可。
+通过本地 WebSocket 实现 PCB 3D 模型在嘉立创 EDA 与 Fusion360 之间的实时协同。支持模型导出（导入到新文档或现有设计）、双向位置同步、交叉定位、删除同步。
 
-通过 WebSocket + HTTP 实现 PCB 3D 模型在嘉立创 EDA 与 Fusion360 之间的实时协同。支持模型导出、双向位置同步、交叉定位、删除同步。
+> 已在 macOS 上测试（2026 年 11 月的 Fusion 版本）。代码不依赖特定平台，欢迎反馈 Windows 上的使用情况。
 
 ## 功能特性
 
@@ -23,6 +15,10 @@
 | 双向位置同步  | EDA 拖动元件 → Fusion360 跟着动，反之亦然        |
 | 交叉定位    | 点击一边的元件，另一边自动聚焦                      |
 | 删除同步    | EDA 删除元件，Fusion360 同步移除              |
+| 导出设置对话框 | 每次导出前选择导入目标、向上轴、板子偏移/旋转以及位置捕获方式 |
+| 导入到当前设计 | 将 PCB 作为一个组件加入现有设计（例如外壳），保留时间线 |
+| 板子放置    | 支持 Y 轴向上/Z 轴向上，以及 X/Y/Z 偏移和旋转；之后修改会重新放置已导入的板子 |
+| 位置捕获    | 可选自动“捕获位置”，时间线中只保留一个捕获 |
 
 ***
 
@@ -60,33 +56,50 @@
 5. 点击运行  这里注意一定是运行模块而不是脚本文件
 
    ![](images/8.png)
-6. **验证启动成功**：在 Fusion360 的文本命令窗口中应看到：
+6. **随 Fusion 自动启动**：按 **Shift+S** → **附加模块（Add-Ins）** 选项卡 → 选择该模块 → 勾选 **启动时运行（Run on Startup）**。
+   如果创建时选的是 *脚本（Script）* 而不是 *附加模块（Add-In）*，请打开其 `.manifest` 文件，把 `"type": "script"` 改为 `"type": "addin"`（并添加 `"runOnStartup": true`），再把文件夹从 `API/Scripts` 移到 `API/AddIns`。
+7. **验证启动成功**：在 Fusion360 的文本命令窗口中应看到：
 
 ```
-[EasyEDA] CustomEvent registered
-[EasyEDA] Add-in 启动完成 ✅
-[EasyEDA] Starting WebSocket server on ws://0.0.0.0:8767
+[EasyEDA:main] CustomEvent registered: easyeda-sync-xxxxxxxx
+[EasyEDA:main] Add-in started, version 1.2.6
+[EasyEDA:ws] Starting WebSocket server on ws://127.0.0.1:8767
+[EasyEDA:ws] WebSocket server listening on 127.0.0.1:8767
 ```
+
+所有日志同时写入 `~/easyeda_fusion.log`。
 
 ## 使用教程
 
 ### 一、导出 3D 模型到 Fusion360
 
-1. 确保 Fusion360 Add-In 脚本已运行
-2. **在 Fusion360 中新建或打开一个部件设计文档**
-
-   ![](images/fusion打开.gif) 
-
-   如果脚本已经运行，直接点击导出按钮即可 会自动打开一个新文档
+1. 确保 Fusion360 附加模块已运行
+2. 在 Fusion360 中打开要放置板子的设计（仅 **导入到当前 Fusion 设计** 时需要）
 3. 在 EDA 中打开一个 PCB 设计文件，进入 **PCB 编辑器**
 4. 点击菜单 **Fusion360机电协同** → **导出3D到Fusion360**
 
-![](images/1.png)\
-5\. 自动连接 Fusion360、获取 STEP 文件并分片上传
+![](images/1.png)
+
+5. 弹出 **导出设置** 对话框（见下文），点击 **导出**
+6. 自动连接 Fusion360、获取 STEP 文件并分片上传
 
 ![](images/2.png)
 
 ![](images/11.png)
+
+### 二、导出设置
+
+| 设置 | 选项 |
+|---|---|
+| 导入目标 | **新建 Fusion 文档**：速度快得多，直接建模模式。**导入到当前 Fusion 设计**：板子作为一个组件加入，保留时间线；大板子较慢（数分钟） |
+| 向上轴 | **自动**（跟随 Fusion 的“默认建模方向”首选项）、**Y 轴向上**（旋转板子使顶面朝向 +Y）、**Z 轴向上**（保持导出方向） |
+| 板子放置 | 在 Fusion 坐标轴上的偏移（mm）和旋转（°），在向上轴旋转之后应用。点击 **保存** 会重新放置已在设计中的板子 |
+| 捕获位置 | **同步停止时捕获一次**、**移动停顿后捕获**（延迟秒数）或 **从不**。勾选 *只保留一个捕获* 时替换之前的捕获，而不是每次新增 |
+| 每次导出时显示此对话框 | 关闭后直接使用已保存的设置导出；可通过菜单 **导出设置** 修改 |
+
+板子放置和元件移动分别保存在时间线的两个捕获中：**EasyEDA placement** 和 **EasyEDA PCB**。您自己创建的捕获不会被改动。
+
+> 只有增删元件时才需要重新导出。重启 Fusion 或 EDA 后，打开设计并点击 **启用双向交互** 即可，板子会按位号重新匹配。
 
 ### 三、启用双向交互
 
@@ -97,7 +110,7 @@
 2. EDA 会自动将元件位号与 Fusion360 3D 对象建立映射（build\_mapping）
 3. 映射成功后可以：
    - **在 EDA 中拖动元件** → Fusion360 中的 3D 模型实时跟随移动
-   - **在 Fusion360 中拖动对象** → EDA 中的元件同步移动（通过 HTTP 轮询检测位置变化）
+   - **在 Fusion360 中拖动对象** → EDA 中的元件同步移动（Fusion 每 2 秒通过 WebSocket 推送位置变化）
    - **在 EDA 中点击元件** → Fusion360 自动选中并聚焦（闪烁高亮）
    - **在 Fusion360 中点击对象** → EDA 自动定位到对应元件
 
@@ -117,7 +130,8 @@
 
 | 菜单选项           | 功能               |
 | -------------- | ---------------- |
-| 导出3D到Fusion360 | 自动连接 + 分片上传 + 导入 |
+| 导出3D到Fusion360 | 打开导出设置对话框，然后自动连接 + 分片上传 + 导入 |
+| 导出设置 | 只修改并保存设置，不导出 |
 | 启用双向交互         | 开启实时双向同步         |
 | 停止双向交互         | 关闭同步并清理映射        |
 | 断开Fusion360    | 断开 WebSocket 连接  |
@@ -130,33 +144,29 @@
 ### 通信架构
 
 ```
-EDA ←— WebSocket:8767 —→ Fusion（命令通道：上传/映射/位置更新/交叉定位）
-EDA ←— HTTP:8768/poll ←— Fusion（状态通道：选中检测/位置变化）
+EDA ←— WebSocket:8767（仅本机）—→ Fusion
 ```
 
-| 方向           | 协议        | 说明                         |
-| ------------ | --------- | -------------------------- |
-| EDA → Fusion | WebSocket | 文件上传、位号映射、位置同步、交叉定位、删除、重命名 |
-| Fusion → EDA | HTTP 轮询   | 每 2 秒检测选中状态和位置变化，返回给 EDA   |
+| 方向 | 说明 |
+|---|---|
+| EDA → Fusion | 文件上传、导出设置、位号映射、位置同步、交叉定位、删除 |
+| Fusion → EDA | 双向交互开启时，每 2 秒推送选中状态和位置变化 |
 
 ### 关键技术决策
 
-| 项目           | 方案                                        | 原因                                                                     |
-| ------------ | ----------------------------------------- | ---------------------------------------------------------------------- |
-| WebSocket 实现 | 纯 Python 手写                               | Fusion360 环境无法安装第三方库                                                   |
-| HTTP 服务器     | Python 内置 `http.server`                   | 轮询检测 Fusion 状态变更                                                       |
-| STEP 导入      | `executeTextCommand('Translator.Import')` | 可从后台线程安全调用，绕过 DataFile 限制                                              |
-| 选中/移动检测      | HTTP 轮询 `ui.activeSelections`             | Fusion360 API 事件（`activeSelectionChanged`、`selectionEvent`）在此版本不响应元件选择 |
-| 位置变化阈值       | 位置 0.1mm，旋转 0.5°                          | 过滤浮点噪声，避免反馈循环                                                          |
+| 项目 | 方案 | 原因 |
+|---|---|---|
+| WebSocket 实现 | 纯 Python（asyncio） | Fusion360 环境无法安装第三方库 |
+| STEP 导入 | `importManager.importToNewDocument()` / `importToTarget2()` | 官方文档化的 API；旧的 `Translator.Import` 文本命令在某些文件路径下失败并超时（issue #2） |
+| 主线程执行 | 队列 + `CustomEvent` | 所有 Fusion API 调用都在 Fusion 主线程执行；WebSocket 线程只负责排队和等待 |
+| 日志 | 主线程写入 Fusion 文本窗口；所有日志同时写入 `~/easyeda_fusion.log` | `app.log()` 不能在后台线程安全调用 |
+| 元件移动 | 在板子自身坐标系中计算，保留元件的翻转/倾斜 | 板子可以在外壳中移动或旋转；底层元件保持翻转 |
+| 板子不作为第一个组件 | 导入到空设计前先创建一个临时空组件 | Fusion 把设计中的第一个组件视为固定，捕获位置时会丢弃它的移动 |
+| 位置变化阈值 | 位置 0.1mm，旋转 0.5° | 过滤浮点噪声，避免反馈循环 |
 
 ### 线程安全
 
-Fusion360 API 要求所有文档操作在主线程执行，但 WebSocket/HTTP 运行在后台线程。
-
-- **读操作**（选中检测、位置读取）：直接从 HTTP/WS 后台线程调用，实际可用但不完全稳定
-- **写操作**（位置更新、交叉定位、删除）：通过 WS 接收命令后直接调用
-- **`executeTextCommand`**：可安全从后台线程调用（Fusion 内部在主线程执行）
-- 轮询间隔 2 秒可减少线程竞争导致的闪退概率
+Fusion360 API 要求所有文档操作在主线程执行，而 WebSocket 服务器运行在后台线程。所有 Fusion API 调用（导入、映射、位置更新、交叉定位、删除、轮询、日志）都会排队，并通过 `CustomEvent` 在主线程执行。停止附加模块时会关闭 WebSocket 服务器并释放端口，因此在 Fusion 中 **停止 / 运行** 可以干净地重新加载代码。
 
 ## 常见问题
 
@@ -164,22 +174,22 @@ Fusion360 API 要求所有文档操作在主线程执行，但 WebSocket/HTTP �
 
 请按顺序检查：
 
-1. **Fusion360 是否已启动**，且 Add-In 脚本已运行
-2. **端口 8767/8768 是否被占用** — 关闭 Fusion360 后重试
+1. **Fusion360 是否已启动**，且附加模块已运行（日志中应有 `WebSocket server listening`）
+2. **端口 8767 是否被占用** — 关闭 Fusion360 后重试
 3. **外部交互权限** — EDA 扩展设置中是否已开启外部交互权限
-4. **防火墙** — 检查 Windows 防火墙是否拦截了端口
+4. **防火墙** — 检查防火墙是否拦截了本机端口 8767
 
-### 导入后 Design OK 但看不到模型
+### 导入到当前设计需要几分钟
 
-确保在导入前已打开或新建了一个 **部件设计** 文档。`Translator.Import` 会将 STEP 导入到当前激活的文档中。
+时间都花在 Fusion 自身的 STEP 导入（`importToTarget2`）上。在带时间线的参数化设计中导入比导入到新的直接建模文档慢得多。这只是一次性开销：元件移动会实时同步，无需重新导入。快速查看时请选择 **新建 Fusion 文档**。
 
-### 导入大文件时 Fusion360 卡住
+### 导入时 Fusion360 无响应
 
-Fusion360 的 STEP 导入是同步操作，大文件导入期间界面可能无响应。导入完成后自动恢复。代码中 `time.sleep(3)` 等待导入完成。
+STEP 导入在 Fusion 主线程中执行，界面会等待导入完成。扩展最多等待 10 分钟。
 
-### 双向交互一段时间后 Fusion360 闪退
+### 日志在哪里？
 
-这是 Fusion360 API 的线程安全限制。后台线程（HTTP/WS）读取 Fusion API 与主线程竞争可能导致崩溃。降低轮询频率可缓解（当前 2 秒一次）。
+Fusion 的文本命令窗口，以及 `~/easyeda_fusion.log`（包含 WebSocket 线程的所有日志）。导入失败时，上传的 STEP 文件会保留在临时文件夹中，方便手动导入排查。
 
 ### Fusion360 中选中元件 EDA 没反应
 
@@ -195,6 +205,8 @@ Fusion360 的 STEP 导入是同步操作，大文件导入期间界面可能无�
 pcb-export-to-fusion/
 ├── src/
 │   └── index.ts                         # EDA 扩展主逻辑（TypeScript）
+├── iframe/
+│   └── settings.html                    # 导出设置对话框
 ├── script/
 │   ├── Interactive-with-fusion.py       # Python脚本
 ├── config/

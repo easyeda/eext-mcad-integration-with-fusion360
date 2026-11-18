@@ -2,17 +2,9 @@
 
 # Fusion360 MCAD Integration — EasyEDA Pro Extension
 
-> ## What's fixed in 1.1.3
-> - **STEP import no longer times out ([#2](https://github.com/easyeda/eext-mcad-integration-with-fusion360/issues/2))**: the add-in uses Fusion's documented `importManager` API instead of the `Translator.Import` text command
-> - **Logging is thread-safe** and also written to `~/easyeda_fusion.log`
-> - **Stop/Run works**: stopping the add-in shuts down the WebSocket server and frees port 8767
-> - **Localhost only**: the server listens on `127.0.0.1` instead of `0.0.0.0`
-> - **Faster uploads** for large boards, and no duplicate imports
-> - **Bottom-side parts stay flipped** when moved
->
-> Only the Fusion add-in changed: replace the Fusion script with `script/Interactive-with-fusion.py`.
+Real-time collaboration between EasyEDA Pro and Fusion360 over a local WebSocket. Supports model export (into a new document or into your existing design), bidirectional position sync, cross-probe, and deletion sync.
 
-Real-time collaboration between EasyEDA Pro and Fusion360 via WebSocket + HTTP. Supports model export, bidirectional position sync, cross-probe, and deletion sync.
+> Tested on macOS with Fusion (November 2026 builds). Nothing in the code is platform-specific, but Windows reports are welcome.
 
 ## Features
 
@@ -23,6 +15,10 @@ Real-time collaboration between EasyEDA Pro and Fusion360 via WebSocket + HTTP. 
 | Bidirectional Position Sync | Drag component in EDA → Fusion360 follows, and vice versa |
 | Cross-Probe | Click a component on one side, the other side auto-focuses |
 | Deletion Sync | Delete component in EDA, Fusion360 removes it simultaneously |
+| Export Settings Dialog | Choose import target, up axis, board offset/rotation and Capture Position behaviour before each export |
+| Import Into Active Design | Add the PCB as one component to your existing (e.g. enclosure) design, keeping its timeline |
+| Board Placement | Y-up/Z-up handling plus X/Y/Z offset and rotation; changing them later re-places the existing board |
+| Capture Position Handling | Optional automatic Capture Position, keeping a single capture in the timeline |
 
 ***
 
@@ -60,33 +56,50 @@ Real-time collaboration between EasyEDA Pro and Fusion360 via WebSocket + HTTP. 
 5. Click Run. Note: you must run the module, not the script file.
 
    ![](images/8.png)
-6. **Verify successful startup**: You should see the following in Fusion360's text command window:
+6. **Start automatically with Fusion**: press **Shift+S** → **Add-Ins** tab → select the add-in → tick **Run on Startup**.
+   If you created it as a *Script* instead of an *Add-In*, open its `.manifest` file and change `"type": "script"` to `"type": "addin"` (and add `"runOnStartup": true`), then move the folder from `API/Scripts` to `API/AddIns`.
+7. **Verify successful startup**: You should see the following in Fusion360's text command window:
 
 ```
-[EasyEDA] CustomEvent registered
-[EasyEDA] Add-in started ✅
-[EasyEDA] Starting WebSocket server on ws://0.0.0.0:8767
+[EasyEDA:main] CustomEvent registered: easyeda-sync-xxxxxxxx
+[EasyEDA:main] Add-in started, version 1.2.6
+[EasyEDA:ws] Starting WebSocket server on ws://127.0.0.1:8767
+[EasyEDA:ws] WebSocket server listening on 127.0.0.1:8767
 ```
+
+Everything is also written to `~/easyeda_fusion.log`.
 
 ## Usage Guide
 
 ### 1. Export 3D Model to Fusion360
 
-1. Make sure the Fusion360 Add-In script is running
-2. **Create or open a component design document in Fusion360**
-
-   ![](images/fusion打开.gif)
-
-   If the script is already running, just click the export button — a new document will be created automatically.
+1. Make sure the Fusion360 add-in is running
+2. In Fusion360, open the design you want the board in (only needed for **Into the active Fusion design**)
 3. Open a PCB design file in EDA, enter the **PCB Editor**
 4. Click menu **Fusion360 MCAD Integration** → **Export 3D to Fusion360**
 
-![](images/1.png)\
-5\. Automatically connects to Fusion360, retrieves the STEP file, and uploads it in chunks.
+![](images/1.png)
+
+5. The **export settings** dialog opens (see below). Click **Export**.
+6. The extension connects to Fusion360, retrieves the STEP file and uploads it in chunks.
 
 ![](images/2.png)
 
 ![](images/11.png)
+
+### Export settings
+
+| Setting | Options |
+|---|---|
+| Import target | **New Fusion document**: much faster, Direct Design mode. **Into the active Fusion design**: the board is added as one component and your timeline is kept; slow for large boards (minutes) |
+| Up axis | **Auto** (follows Fusion's *Default modeling orientation* preference), **Y up** (board is turned so its top faces +Y), **Z up** (as exported) |
+| Board placement | Offset (mm) and rotation (°) on the Fusion axes, applied after the up-axis turn. Clicking **Save** re-places a board that is already in the design |
+| Capture Position | **Once, when sync stops**, **After a pause in moves** (delay in seconds) or **Never**. *Keep a single capture* replaces the previous add-in capture instead of adding a new one each time |
+| Show this dialog on every export | When off, export uses the saved settings; change them via **Fusion 360 export settings** in the menu |
+
+Board placement and part moves are stored in two timeline captures, **EasyEDA placement** and **EasyEDA PCB**. Captures you make yourself are not touched.
+
+> Re-export only when parts are added or removed. After restarting Fusion or EasyEDA, open the design and click **Enable Bidirectional**; the board is found again by designator.
 
 ### 2. Enable Bidirectional Interaction
 
@@ -97,7 +110,7 @@ After exporting the model, you can enable bidirectional interaction for real-tim
 2. EDA will automatically map component designators to Fusion360 3D objects (build\_mapping)
 3. After mapping is successful, you can:
    - **Drag a component in EDA** → The 3D model in Fusion360 follows in real-time
-   - **Drag an object in Fusion360** → The component in EDA moves synchronously (via HTTP polling for position changes)
+   - **Drag an object in Fusion360** → The component in EDA moves synchronously (Fusion pushes position changes over the WebSocket every 2 seconds)
    - **Click a component in EDA** → Fusion360 auto-selects and focuses (flashing highlight)
    - **Click an object in Fusion360** → EDA auto-navigates to the corresponding component
 
@@ -117,7 +130,8 @@ After exporting the model, you can enable bidirectional interaction for real-tim
 
 | Menu Option | Function |
 |---|---|
-| Export 3D to Fusion360 | Auto-connect + chunked upload + import |
+| Export 3D to Fusion360 | Opens the settings dialog, then auto-connect + chunked upload + import |
+| Fusion 360 export settings | Change and save settings without exporting |
 | Enable Bidirectional | Enable real-time bidirectional sync |
 | Disable Bidirectional | Stop sync and clear mappings |
 | Disconnect Fusion360 | Disconnect WebSocket connection |
@@ -130,33 +144,29 @@ After exporting the model, you can enable bidirectional interaction for real-tim
 ### Communication Architecture
 
 ```
-EDA ←— WebSocket:8767 —→ Fusion (Command channel: upload/mapping/position update/cross-probe)
-EDA ←— HTTP:8768/poll ←— Fusion (Status channel: selection detection/position changes)
+EDA ←— WebSocket:8767 (localhost only) —→ Fusion
 ```
 
-| Direction | Protocol | Description |
-|---|---|---|
-| EDA → Fusion | WebSocket | File upload, designator mapping, position sync, cross-probe, delete, rename |
-| Fusion → EDA | HTTP Polling | Detect selection state and position changes every 2 seconds, return to EDA |
+| Direction | Description |
+|---|---|
+| EDA → Fusion | File upload, export settings, designator mapping, position sync, cross-probe, delete |
+| Fusion → EDA | Selection and position changes, pushed every 2 seconds while bidirectional sync is on |
 
 ### Key Technical Decisions
 
 | Item | Solution | Reason |
 |---|---|---|
-| WebSocket Implementation | Pure Python | Fusion360 environment cannot install third-party libraries |
-| HTTP Server | Python built-in `http.server` | Polling for Fusion state changes |
-| STEP Import | `executeTextCommand('Translator.Import')` | Can be safely called from background thread, bypasses DataFile limitations |
-| Selection/Movement Detection | HTTP polling `ui.activeSelections` | Fusion360 API events (`activeSelectionChanged`, `selectionEvent`) do not respond to component selection in this version |
+| WebSocket Implementation | Pure Python (asyncio) | Fusion360 environment cannot install third-party libraries |
+| STEP Import | `importManager.importToNewDocument()` / `importToTarget2()` | Documented API; the old `Translator.Import` text command failed on some file paths and timed out (issue #2) |
+| Main-thread work | Queue + `CustomEvent` | All Fusion API calls run on Fusion's main thread; the WebSocket thread only queues work and waits |
+| Logging | Main thread → Fusion text window; every line also to `~/easyeda_fusion.log` | `app.log()` is not safe from background threads |
+| Part moves | Computed in the board's own frame, keeping each part's flip/tilt | Board can be moved or rotated inside an enclosure; bottom-side parts stay flipped |
+| Board never first component | A temporary empty component is created before importing into an empty design | Fusion treats the first component as anchored, and Capture Position drops its move |
 | Position Change Threshold | Position 0.1mm, Rotation 0.5° | Filter floating-point noise, avoid feedback loops |
 
 ### Thread Safety
 
-Fusion360 API requires all document operations to run on the main thread, but WebSocket/HTTP runs on background threads.
-
-- **Read operations** (selection detection, position reading): Can be called directly from HTTP/WS background threads, works but not fully stable
-- **Write operations** (position update, cross-probe, delete): Commands received via WS are called directly
-- **`executeTextCommand`**: Can be safely called from background thread (Fusion executes internally on main thread)
-- Polling interval of 2 seconds reduces crash probability caused by thread contention
+Fusion360 API requires all document operations to run on the main thread, while the WebSocket server runs on a background thread. Every Fusion API call (import, mapping, position updates, cross-probe, delete, polling, logging) is queued and executed on the main thread via a `CustomEvent`. Stopping the add-in shuts the WebSocket server down and frees the port, so **Stop / Run** in Fusion reloads the code cleanly.
 
 ## FAQ
 
@@ -164,22 +174,22 @@ Fusion360 API requires all document operations to run on the main thread, but We
 
 Check in order:
 
-1. **Is Fusion360 running** and the Add-In script is active
-2. **Is port 8767/8768 occupied** — Close Fusion360 and retry
+1. **Is Fusion360 running** and the add-in active (check the log for `WebSocket server listening`)
+2. **Is port 8767 occupied** — Close Fusion360 and retry
 3. **External interaction permission** — Is it enabled in EDA extension settings
-4. **Firewall** — Check if Windows firewall is blocking the port
+4. **Firewall** — Check if a firewall is blocking localhost port 8767
 
-### "Design OK" after import but no model visible
+### Import into the active design takes minutes
 
-Make sure a **component design** document is open or created before import. `Translator.Import` imports the STEP into the currently active document.
+That time is spent inside Fusion's own STEP import (`importToTarget2`), which is much slower in a parametric design with a timeline than into a new Direct-mode document. It is a one-time cost: moves sync live without re-importing. Use **New Fusion document** for quick checks.
 
-### Fusion360 freezes when importing large files
+### Fusion360 is unresponsive during import
 
-Fusion360's STEP import is a synchronous operation. The UI may become unresponsive during large file imports. It recovers automatically after import completes. The code uses `time.sleep(3)` to wait for import completion.
+STEP import runs on Fusion's main thread, so the UI waits until it finishes. The extension waits up to 10 minutes for the result.
 
-### Fusion360 crashes after bidirectional interaction runs for a while
+### Where is the log?
 
-This is a Fusion360 API thread safety limitation. Background threads (HTTP/WS) reading Fusion API may compete with the main thread, causing crashes. Reducing polling frequency can help (currently 2 seconds).
+Fusion's text command window, and `~/easyeda_fusion.log` (every line, including those from the WebSocket thread). If an import fails, the uploaded STEP file is kept in the temp folder so you can try importing it by hand.
 
 ### Selecting a component in Fusion360 has no response in EDA
 
@@ -195,6 +205,8 @@ This is a Fusion360 API thread safety limitation. Background threads (HTTP/WS) r
 pcb-export-to-fusion/
 ├── src/
 │   └── index.ts                         # EDA extension main logic (TypeScript)
+├── iframe/
+│   └── settings.html                    # Export settings dialog
 ├── script/
 │   ├── Interactive-with-fusion.py       # Python script
 ├── config/

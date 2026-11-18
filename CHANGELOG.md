@@ -1,5 +1,19 @@
 # Fusion360 机电协同 -- 变更记录
 
+# 1.2.7
+### 新功能 / Features
+
+- **导出设置对话框**（中英文）：导入目标、向上轴、板子偏移/旋转、捕获位置方式；新菜单项 **导出设置** / Export settings dialog (Chinese/English): import target, up axis, board offset/rotation, Capture Position behaviour; new menu item **Fusion 360 export settings**
+- **导入到当前 Fusion 设计**，保留时间线 / Import into the active Fusion design, keeping its timeline
+- **Y 轴向上 / Z 轴向上** 与板子偏移/旋转；修改后点击保存会重新放置已导入的板子；板子在设计中带标记，重启后可重新找到 / Y-up/Z-up handling and board offset/rotation; Save re-places an imported board; the board is tagged so it is found again after a restart
+- **元件移动在板子坐标系中计算**：板子可在外壳中移动或旋转 / Part moves are computed in the board's frame, so the board can be moved or rotated inside an enclosure
+- **捕获位置**：同步停止时、移动停顿后或从不；可只保留一个捕获。板子放置与元件移动分别保存在 **EasyEDA placement** 和 **EasyEDA PCB** 捕获中 / Capture Position when sync stops, after a pause, or never; optionally a single capture. Placement and part moves use separate captures
+
+### 修复 / Fixes
+
+- **防止重复导出**：一次点击只会导出一次 / A single click can no longer trigger two exports
+- **板子不作为设计中的第一个组件**：Fusion 把第一个组件视为固定，捕获位置时会丢弃它的移动 / The board is never the design's first component; Fusion treats that one as anchored and Capture Position drops its move
+
 # 1.1.3
 ### 修复 / Fixes
 
